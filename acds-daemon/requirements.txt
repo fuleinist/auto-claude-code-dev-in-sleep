@@ -1,0 +1,2 @@
+# acds-daemon dependencies
+typing-extensions>=4.0
