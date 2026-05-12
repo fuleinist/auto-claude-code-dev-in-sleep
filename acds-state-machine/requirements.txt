@@ -1,0 +1,2 @@
+# acds-state-machine dependencies
+typing-extensions>=4.0
