@@ -1,0 +1,2 @@
+# acds-report dependencies
+typing-extensions>=4.0
