@@ -1,0 +1,2 @@
+# acds-pr-bot dependencies
+urllib3>=1.26.0
