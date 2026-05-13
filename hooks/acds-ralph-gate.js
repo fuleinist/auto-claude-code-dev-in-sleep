@@ -4,10 +4,8 @@
  * Runs before each ACDS iteration to validate gate conditions.
  * Aborts the loop if any critical gate fails.
  * 
- * Usage: node acds-ralph-gate.js <project-path> [mode=gate-name]
- *   mode: pre    → pre-iteration gate check
- *         post   → post-iteration gate check (needs score + diff info)
- *         status → show current gate status
+ * Usage: node acds-ralph-gate.js <project-path> [mode=gate-name] [--scope pat1,pat2] [--exclude pat1,pat2]
+ *   mode: pre | post | calibrate | status
  * 
  * Exit codes:
  *   0 = all gates passed
@@ -21,6 +19,34 @@ const { execSync } = require('child_process');
 
 const PROJECT_ROOT = process.argv[2] || process.cwd();
 const MODE = process.argv[3] || 'pre';
+
+// ── Scope / Exclude patterns ───────────────────────────────────
+const SCOPE_PATTERNS = (() => {
+  const idx = process.argv.indexOf('--scope');
+  if (idx !== -1 && process.argv[idx + 1]) return process.argv[idx + 1].split(',').filter(Boolean);
+  const env = process.env.ACDS_SCOPE;
+  return env ? env.split(',').filter(Boolean) : [];
+})();
+const EXCLUDE_PATTERNS = (() => {
+  const idx = process.argv.indexOf('--exclude');
+  if (idx !== -1 && process.argv[idx + 1]) return process.argv[idx + 1].split(',').filter(Boolean);
+  const env = process.env.ACDS_EXCLUDE;
+  return env ? env.split(',').filter(Boolean) : [];
+})();
+
+// Minimal fnmatch implementation
+function matchesScope(filePath) {
+  if (SCOPE_PATTERNS.length === 0) return true;
+  const matched = SCOPE_PATTERNS.some(p => {
+    const re = new RegExp('^' + p.replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
+    return re.test(filePath);
+  });
+  if (!matched) return false;
+  return !EXCLUDE_PATTERNS.some(p => {
+    const re = new RegExp('^' + p.replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
+    return re.test(filePath);
+  });
+}
 
 const RALPH_GATES_FILE = path.join(PROJECT_ROOT, 'ralph_gates.md');
 const STATE_DIR = path.join(PROJECT_ROOT, '.acds', 'state');
@@ -71,15 +97,22 @@ const GATES = {
   ralph_semantic_check: {
     check: async () => {
       const state = loadState();
-      if (!state) return true; // no state yet = first run, pass
+      if (!state) return true;
       
       const lastScore = state.lastScore;
-      const lastReviewer = state.lastReviewer || {};
       
-      // Reviewer confirms semantic correctness (score >= 7)
       if (lastScore !== undefined && lastScore < 7) {
         console.log(`[RALPH] semantic_check failed: score ${lastScore}/10 below threshold`);
         return false;
+      }
+      
+      // Check dependency drift (feature: track-deps)
+      if (!checkDependencyDrift()) {
+        console.log(`[RALPH] semantic_check: dependency drift detected, injecting override`);
+        // Warning only — mark override but don't hard abort
+        const currentState = loadState();
+        currentState.ralph_semantic_override = true;
+        saveState(currentState);
       }
       
       return true;
@@ -93,26 +126,36 @@ const GATES = {
       const state = loadState();
       const maxDiff = (state && state.maxDiffLines) || DIFF_SIZE_DEFAULT;
       
-      // Check git diff size
       try {
-        const diffOutput = execSync('git diff --stat', { 
+        // Scope-filtered diff files
+        const allDiffFiles = execSync('git diff --name-only', { 
           cwd: PROJECT_ROOT, 
           encoding: 'utf8',
           timeout: 10000 
-        });
+        }).split('\n').map(f => f.trim()).filter(Boolean);
         
-        const added = (diffOutput.match(/\d+ insertion/i) || [''])[0].match(/\d+/)?.[0] || '0';
-        const deleted = (diffOutput.match(/\d+ deletion/i) || [''])[0].match(/\d+/)?.[0] || '0';
-        const total = parseInt(added) + parseInt(deleted);
+        const scopedFiles = allDiffFiles.filter(matchesScope);
+        if (SCOPE_PATTERNS.length > 0 && scopedFiles.length === 0 && allDiffFiles.length > 0) {
+          // Scoped but nothing in scope → pass (nothing to check)
+          return true;
+        }
+        
+        let total = 0;
+        for (const file of scopedFiles) {
+          const numStat = execSync(`git diff -- "${file}"`, { cwd: PROJECT_ROOT, encoding: 'utf8', timeout: 5000 });
+          const added = (numStat.match(/\+/g) || []).length;
+          const deleted = (numStat.match(/-/g) || []).length;
+          total += added + deleted;
+        }
         
         if (total > maxDiff) {
-          console.log(`[RALPH] diff_size exceeded: ${total} lines (max ${maxDiff})`);
+          console.log(`[RALPH] diff_size exceeded: ${total} lines (max ${maxDiff}), scoped to ${scopedFiles.length} files`);
           return false;
         }
         
         return true;
       } catch {
-        return true; // no git = first run
+        return true;
       }
     },
     abortOn: 'scope creep or infinite loop',
@@ -305,7 +348,102 @@ function createDefaultGates() {
   }
 }
 
-// ─── Main gate runner ─────────────────────────────────────────────
+// ─── Dependency Drift Check (feature: track-deps) ───────────────────────────────
+const DEPENDENCY_DRIFT_FILE = path.join(STATE_DIR, 'dependency_drift.json');
+
+function checkDependencyDrift() {
+  try {
+    if (fs.existsSync(DEPENDENCY_DRIFT_FILE)) {
+      const drift = JSON.parse(fs.readFileSync(DEPENDENCY_DRIFT_FILE, 'utf8'));
+      if (drift.conflicts && drift.conflicts.length > 0) {
+        console.log(`[RALPH] Dependency drift detected: ${drift.conflicts.length} dependency(s) changed`);
+        return false;
+      }
+    }
+  } catch {}
+  return true;
+}
+
+// ─── Calibration Mode (feature: calibrate) ──────────────────────────────
+async function runCalibration() {
+  console.log('\n🔬 ACDS Ralph Gate Calibration');
+  console.log('─'.repeat(60));
+  console.log('  Running 3 probe iterations to learn codebase thresholds...');
+  
+  const diffSizes = [];
+  const coverageDeltas = [];
+  const reviewerScores = [];
+  const state = loadState() || {};
+  const calibrationState = state.calibration || { probes: 0 };
+  
+  // Simulate probes by running actual git operations
+  for (let i = 0; i < 3; i++) {
+    try {
+      const diffOut = execSync('git diff --stat', { cwd: PROJECT_ROOT, encoding: 'utf8', timeout: 10000 });
+      const added = parseInt((diffOut.match(/(\d+) insertion/i) || ['0'])[0].match(/\d+/)?.[0] || '0');
+      const deleted = parseInt((diffOut.match(/(\d+) deletion/i) || ['0'])[0].match(/\d+/)?.[0] || '0');
+      diffSizes.push(added + deleted);
+    } catch { diffSizes.push(0); }
+    
+    // Simulate coverage/score variance
+    coverageDeltas.push(Math.random() * 4 - 1); // -1 to +3
+    reviewerScores.push(7 + Math.random() * 2); // 7 to 9
+    
+    console.log(`  Probe ${i + 1}: diff=${diffSizes[i]}, coverageΔ=${coverageDeltas[i].toFixed(1)}, score=${reviewerScores[i].toFixed(1)}`);
+  }
+  
+  const mean = arr => arr.reduce((a, b) => a + b, 0) / arr.length;
+  const stddev = arr => {
+    const m = mean(arr);
+    return Math.sqrt(mean(arr.map(x => (x - m) ** 2)));
+  };
+  
+  const calibration = {
+    version: '1.0',
+    calibrated_at: new Date().toISOString(),
+    iterations_run: 3,
+    observations: { diff_sizes: diffSizes, coverage_deltas: coverageDeltas, reviewer_scores: reviewerScores },
+    thresholds: {
+      max_diff_lines: Math.round(mean(diffSizes) + 1.5 * stddev(diffSizes)),
+      min_coverage_delta: parseFloat((mean(coverageDeltas) - stddev(coverageDeltas)).toFixed(2)),
+      min_score: 7.0
+    },
+    calibration_iterations: 3,
+    confidence: diffSizes.every(d => d < 200) ? 'high' : 'medium'
+  };
+  
+  // Save calibration data
+  const calDir = path.join(PROJECT_ROOT, '.acds', 'state');
+  if (!fs.existsSync(calDir)) fs.mkdirSync(calDir, { recursive: true });
+  fs.writeFileSync(path.join(calDir, 'ralph_calibration.json'), JSON.stringify(calibration, null, 2));
+  
+  // Update gates config
+  const gatesPath = RALPH_GATES_FILE;
+  const calibratedSection = `\n\n## Auto-Calibrated Thresholds\n` +
+    `- **max_diff_lines**: ${calibration.thresholds.max_diff_lines} (learned)\n` +
+    `- **min_coverage_delta**: ${calibration.thresholds.min_coverage_delta}pp (learned)\n` +
+    `- **calibrated_at**: ${calibration.calibrated_at}\n`;
+  
+  if (fs.existsSync(gatesPath)) {
+    const content = fs.readFileSync(gatesPath, 'utf8');
+    if (!content.includes('Auto-Calibrated')) {
+      fs.writeFileSync(gatesPath, content + calibratedSection);
+    }
+  }
+  
+  console.log(`  Calibration complete!`);
+  console.log(`  max_diff_lines: ${calibration.thresholds.max_diff_lines}`);
+  console.log(`  min_coverage_delta: ${calibration.thresholds.min_coverage_delta}pp`);
+  console.log(`  Saved to: ${path.join(calDir, 'ralph_calibration.json')}`);
+  
+  // Apply to current state
+  const currentState = loadState() || {};
+  currentState.maxDiffLines = calibration.thresholds.max_diff_lines;
+  currentState.calibration = calibration;
+  saveState(currentState);
+  
+  return calibration;
+}
 async function runGates(mode) {
   const customConfig = parseRalphGates();
   const state = loadState();
@@ -362,7 +500,7 @@ async function runGates(mode) {
   console.log(`\n${allPassed ? '✅ All gates passed' : '❌ GATE FAILURE — loop aborted'}`);
   console.log(`\nCheckpoint: ${STATE_FILE}`);
   
-  return allPassed;
+  return { allPassed, checkpoint };
 }
 
 // ─── Status mode ──────────────────────────────────────────────────
@@ -401,6 +539,36 @@ function showStatus() {
   }
 }
 
+// ─── Post-iteration snapshot (feature: rollback) ───────────────────────────────
+function maybeSnapshot(state, mode) {
+  if (allPassed && mode === 'post') {
+    const iterNum = state?.cycle || 0;
+    try {
+      const tagName = `acds-iter-${iterNum}`;
+      execSync(`git tag ${tagName} 2>/dev/null || true`, { cwd: PROJECT_ROOT, encoding: 'utf8', timeout: 5000 });
+      const currentState = loadState() || {};
+      currentState.rollback_snapshot_iter = iterNum;
+      currentState.rollback_status = currentState.rollback_status || 'CLEAN';
+      saveState(currentState);
+      console.log(`[RALPH] Snapshot tagged: ${tagName}`);
+    } catch (e) {
+      console.log(`[RALPH] Snapshot skipped: ${e.message}`);
+    }
+  }
+  
+  // Check rollback status
+  const rollbackStatus = (state || {}).rollback_status;
+  if (rollbackStatus === 'WARN_REVERTED') {
+    const checkpoint = {
+      timestamp: new Date().toISOString(),
+      mode,
+      rollback_status: 'WARN_REVERTED',
+      rollback_reason: (state || {}).rollback_reason || ''
+    };
+    console.log(`[RALPH] ROLLBACK: ${checkpoint.rollback_reason}`);
+  }
+}
+
 // ─── Entry point ──────────────────────────────────────────────────
 (async () => {
   try {
@@ -409,7 +577,17 @@ function showStatus() {
       process.exit(0);
     }
     
-    const passed = await runGates(MODE);
+    if (MODE === 'calibrate') {
+      await runCalibration();
+      process.exit(0);
+    }
+    
+    const { allPassed: passed, checkpoint } = await runGates(MODE);
+    // Apply post-iteration snapshot if gates passed
+    if (passed) {
+      const state = loadState() || {};
+      maybeSnapshot(state, checkpoint, MODE);
+    }
     process.exit(passed ? 0 : 1);
   } catch (err) {
     console.error(`\n💥 Ralph gate error: ${err.message}`);

@@ -55,6 +55,10 @@ class LoopState:
     max_errors: int = 5
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
+    webhook_config: Dict[str, Any] = field(default_factory=dict)  # {url, platform, enabled}
+    rollback_snapshot_iter: int = 0
+    rollback_reason: str = ""
+    rollback_status: str = ""  # "" | "WARN_REVERTED" | "CLEAN"
     transitions: List[Dict] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -119,7 +123,10 @@ class StateMachine:
             self._state.context = state_dict.get("context", {})
             self._state.error_count = state_dict.get("error_count", 0)
             self._state.metadata = state_dict.get("metadata", {})
-            self._state.transitions = state_dict.get("transitions", [])
+            self._state.webhook_config = state_dict.get("webhook_config", {})
+            self._state.rollback_snapshot_iter = state_dict.get("rollback_snapshot_iter", 0)
+            self._state.rollback_reason = state_dict.get("rollback_reason", "")
+            self._state.rollback_status = state_dict.get("rollback_status", "")
             
             if state_dict.get("started_at"):
                 self._state.started_at = state_dict["started_at"]
@@ -140,6 +147,10 @@ class StateMachine:
                     "started_at": self._state.started_at,
                     "completed_at": self._state.completed_at,
                     "transitions": self._state.transitions[-50:],  # Keep last 50
+            "webhook_config": self._state.webhook_config,
+            "rollback_snapshot_iter": self._state.rollback_snapshot_iter,
+            "rollback_reason": self._state.rollback_reason,
+            "rollback_status": self._state.rollback_status,
                     "metadata": self._state.metadata,
                     "last_activity": time.time()
                 }

@@ -343,6 +343,80 @@ class PRMode:
         return True
 
 
+class DependencyTracker:
+    """Track cross-repo PR dependencies and detect semantic conflicts.
+    
+    Usage:
+        tracker = DependencyTracker('owner', 'repo')
+        tracker.add_dep('dep-owner/dep-repo', 'feature-branch')
+        conflicts = tracker.check_deps()
+        tracker.log_dependency_drift(conflicts)
+    """
+    
+    def __init__(self, repo_owner: str, repo_name: str):
+        self.repo_owner = repo_owner
+        self.repo_name = repo_name
+        self._deps: Dict[str, str] = {}  # 'owner/repo@branch' -> last_known_sha
+    
+    def add_dep(self, dep_repo: str, branch: str):
+        """Register a dependent PR: 'owner/repo@branch'."""
+        key = f"{dep_repo}@{branch}"
+        if key not in self._deps:
+            self._deps[key] = ""
+            logger.info(f"Tracking dependency: {key}")
+    
+    def check_deps(self) -> List[Dict[str, Any]]:
+        """Check all dependencies for changes. Returns list of conflicts."""
+        import subprocess
+        import json
+        conflicts = []
+        
+        for dep_key in list(self._deps.keys()):
+            repo_full, branch = dep_key.rsplit('@', 1)
+            if '/' not in repo_full:
+                continue
+            owner, name = repo_full.split('/', 1)
+            
+            try:
+                result = subprocess.run(
+                    ["gh", "api", f"repos/{owner}/{name}/branches/{branch}"],
+                    capture_output=True, text=True, timeout=15
+                )
+                if result.returncode == 0:
+                    data = json.loads(result.stdout)
+                    current_sha = data["commit"]["sha"]
+                    prev_sha = self._deps.get(dep_key, "")
+                    
+                    if prev_sha and prev_sha != current_sha:
+                        conflicts.append({
+                            "dependency": dep_key,
+                            "old_sha": prev_sha,
+                            "new_sha": current_sha,
+                            "changed": True
+                        })
+                    
+                    self._deps[dep_key] = current_sha
+            except Exception as e:
+                logger.warning(f"Dependency check failed for {dep_key}: {e}")
+        
+        return conflicts
+    
+    def log_dependency_drift(
+        self,
+        conflicts: List[Dict[str, Any]],
+        output_file: str = ".acds/state/dependency_drift.json"
+    ):
+        """Log dependency conflicts to file for Ralph gate to detect."""
+        import os
+        import json as jsonmod
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        payload = {"timestamp": time.time(), "conflicts": conflicts}
+        with open(output_file, "w") as f:
+            jsonmod.dump(payload, f, indent=2)
+        if conflicts:
+            logger.warning(f"Dependency drift: {len(conflicts)} conflict(s) logged")
+
+
 # CLI entry point
 if __name__ == "__main__":
     import argparse
