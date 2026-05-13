@@ -98,7 +98,7 @@ const SKILL_REGISTRY = {
     'security-audit': {
       repo: 'trailofbits/security-audit',
       desc: 'Security audit patterns',
-      url: 'https://github.com/trailofbits/sec)
+      url: 'https://github.com/trailofbits/security-audit'
     },
     'docs-gen': {
       repo: 'anthropics/md',
@@ -267,6 +267,15 @@ async function main() {
   console.log(`\n  Toolchain history saved: ${toolchainFile}`);
   
   // Output for consumption
+  // Log dependency tracking (feature: track-deps)
+  const trackDepsIdx = process.argv.indexOf('--track-deps');
+  if (trackDepsIdx !== -1 && process.argv[trackDepsIdx + 1]) {
+    const dep = process.argv[trackDepsIdx + 1];
+    history.iterations[history.iterations.length - 1].dependency = dep;
+    history.iterations[history.iterations.length - 1].dependency_raw = process.argv.slice(trackDepsIdx + 1).join(' ');
+    console.log(`\n  Tracking dependency: ${dep}`);
+  }
+
   console.log('\n  ACDS_TOOLCHAIN_JSON=' + JSON.stringify(skills));
 }
 

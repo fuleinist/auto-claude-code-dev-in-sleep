@@ -1,7 +1,7 @@
 ---
 name: acds:start
-description: "Auto-Claude-Code-Dev-in-Sleep: run autonomous cross-model improvement loop with Ralph Loop gates. Usage: acds:start <path> [--mode dev|pr|diff] [--max-iterations N] [--effort lite|balanced|max|beast] [--human-checkpoint]"
-argument-hint: "<path> [--mode dev|pr|diff] [--max-iterations N] [--effort lite|balanced|max|beast] [--human-checkpoint]"
+description: "Auto-Claude-Code-Dev-in-Sleep: run autonomous cross-model improvement loop with Ralph Loop gates. Usage: acds:start <path> [--mode dev|pr|diff] [--max-iterations N] [--effort lite|balanced|max|beast] [--human-checkpoint] [--scope <glob,...>] [--exclude <glob,...>] [--calibrate] [--track-deps owner/repo@branch] [--notify-channel <webhook-url>]"
+argument-hint: "<path> [--mode dev|pr|diff] [--max-iterations N] [--effort lite|balanced|max|beast] [--human-checkpoint] [--scope <glob,...>] [--exclude <glob,...>] [--calibrate] [--track-deps owner/repo@branch] [--notify-channel <webhook-url>]"
 allowed-tools:
   - Read
   - Write
@@ -111,6 +111,24 @@ Write ITERATION_DIARY.md and ITERATION_DIARY.html with:
 - balanced: 1 revision cycle if score < 8
 - max: 3 revision cycles, full test suite
 - beast: unlimited revisions until score >= 9
+
+## New Parameters
+
+### `--scope <glob,...>` and `--exclude <glob,...>`
+Scope the ACDS loop to specific file patterns using comma-separated glob patterns.
+- `--scope "src/**/*.ts,lib/*.py"` — only operate on matching files
+- `--exclude "tests/**,*.test.ts"` — exclude matching files from scope
+- Ralph gates (diff size, coverage) apply only to scoped files
+- Enables parallel ACDS runs on different modules of the same repo
+
+### `--calibrate`
+Run 2-3 probe iterations to auto-tune Ralph gate thresholds for the specific codebase. Generates `.acds/ralph_calibration.json` with calibrated diff size, coverage delta, and score thresholds. Updates `ralph_gates.md` with learned values.
+
+### `--track-deps owner/repo@branch`
+Track dependent PR branches for cross-repo semantic conflict detection. If a tracked dependency changes, ACDS injects a `ralph_semantic_override` flag, logs the conflict to `.acds/state/dependency_drift.json`, and optionally notifies via `--notify-channel`.
+
+### `--notify-channel <webhook-url>`
+Send Slack Block Kit or Discord embed notifications at each Ralph gate checkpoint. If combined with `--human-checkpoint`, blocks and waits for human approval (Approve / Force Abort) via the local callback server (default port 8765). Format is auto-detected from the URL.
 
 ## Mode behaviour:
 - dev: general codebase improvement
